@@ -1,103 +1,114 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"net/http"
-	"os"
-
-	ovs "github.com/kongseokhwan/hellios-prometheus-exporter/pkg/ovs_exporter"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/log"
+	"syscall"
 )
 
 func main() {
-	var listenAddress string
-	var metricsPath string
-	var pollTimeout int
-	var pollInterval int
-	var isShowVersion bool
-	var logLevel string
-	var systemRunDir string
-	var databaseVswitchName string
-	var databaseVswitchSocketRemote string
-	var databaseVswitchFileDataPath string
-	var databaseVswitchFileLogPath string
-	var databaseVswitchFilePidPath string
-	var databaseVswitchFileSystemIDPath string
-	var serviceVswitchdFileLogPath string
-	var serviceVswitchdFilePidPath string
+	l, _ := ListenNetlink()
 
-	flag.StringVar(&listenAddress, "web.listen-address", ":9476", "Address to listen on for web interface and telemetry.")
-	flag.StringVar(&metricsPath, "web.telemetry-path", "/metrics", "Path under which to expose metrics.")
-	flag.IntVar(&pollTimeout, "ovs.timeout", 2, "Timeout on gRPC requests to ovs.")
-	flag.IntVar(&pollInterval, "ovs.poll-interval", 15, "The minimum interval (in seconds) between collections from ovs server.")
-	flag.BoolVar(&isShowVersion, "version", false, "version information")
-	flag.StringVar(&logLevel, "log.level", "info", "logging severity level")
-
-	flag.StringVar(&systemRunDir, "system.run.dir", "/var/run/openvswitch", "OVS default run directory.")
-
-	flag.StringVar(&databaseVswitchName, "database.vswitch.name", "Open_vSwitch", "The name of OVS db.")
-	flag.StringVar(&databaseVswitchSocketRemote, "database.vswitch.socket.remote", "unix:/var/run/openvswitch/db.sock", "JSON-RPC unix socket to OVS db.")
-	flag.StringVar(&databaseVswitchFileDataPath, "database.vswitch.file.data.path", "/etc/openvswitch/conf.db", "OVS db file.")
-	flag.StringVar(&databaseVswitchFileLogPath, "database.vswitch.file.log.path", "/var/log/openvswitch/ovsdb-server.log", "OVS db log file.")
-	flag.StringVar(&databaseVswitchFilePidPath, "database.vswitch.file.pid.path", "/var/run/openvswitch/ovsdb-server.pid", "OVS db process id file.")
-	flag.StringVar(&databaseVswitchFileSystemIDPath, "database.vswitch.file.system.id.path", "/etc/openvswitch/system-id.conf", "OVS system id file.")
-
-	flag.StringVar(&serviceVswitchdFileLogPath, "service.vswitchd.file.log.path", "/var/log/openvswitch/ovs-vswitchd.log", "OVS vswitchd daemon log file.")
-	flag.StringVar(&serviceVswitchdFilePidPath, "service.vswitchd.file.pid.path", "/var/run/openvswitch/ovs-vswitchd.pid", "OVS vswitchd daemon process id file.")
-
-	var usageHelp = func() {
-		fmt.Fprintf(os.Stderr, "\n%s - Prometheus Exporter for Open VSwitvh (ovs)\n\n", ovs.GetExporterName())
-		fmt.Fprintf(os.Stderr, "Usage: %s [arguments]\n\n", ovs.GetExporterName())
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nDocumentation: https://github.com/kongseokhwan/hellios-prometheus-exporter/\n\n")
-	}
-	flag.Usage = usageHelp
-	flag.Parse()
-
-	opts := ovs.Options{
-		Timeout: pollTimeout,
-	}
-
-	if err := log.Base().SetLevel(logLevel); err != nil {
-		log.Errorf(err.Error())
-		os.Exit(1)
-	}
-
-	if isShowVersion {
-		fmt.Fprintf(os.Stdout, "%s %s", ovs.GetExporterName(), ovs.GetVersion())
-		if ovs.GetRevision() != "" {
-			fmt.Fprintf(os.Stdout, ", commit: %s\n", ovs.GetRevision())
-		} else {
-			fmt.Fprint(os.Stdout, "\n")
+	for {
+		msgs, err := l.ReadMsgs()
+		if err != nil {
+			fmt.Println("Could not read netlink: %s", err)
 		}
-		os.Exit(0)
+
+		for _, m := range msgs {
+			if IsNewAddr(&m) {
+				fmt.Println("New Addr")
+			}
+
+			if IsDelAddr(&m) {
+				fmt.Println("Del Addr")
+			}
+		}
 	}
+}
 
-	log.Infof("Starting %s %s", ovs.GetExporterName(), ovs.GetVersionInfo())
-	log.Infof("Build context %s", ovs.GetVersionBuildContext())
+type NetlinkListener struct {
+	fd int
+	sa *syscall.SockaddrNetlink
+}
 
-	exporter, err := ovs.NewExporter(opts)
+func ListenNetlink() (*NetlinkListener, error) {
+	groups := (1 << (syscall.RTNLGRP_LINK - 1)) |
+		(1 << (syscall.RTNLGRP_IPV4_IFADDR - 1)) |
+		(1 << (syscall.RTNLGRP_IPV6_IFADDR - 1))
+
+	s, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM,
+		syscall.NETLINK_ROUTE)
 	if err != nil {
-		log.Errorf("%s failed to init properly: %s", ovs.GetExporterName(), err)
+		return nil, fmt.Errorf("socket: %s", err)
 	}
 
-	exporter.SetPollInterval(int64(pollInterval))
-	prometheus.MustRegister(exporter)
+	saddr := &syscall.SockaddrNetlink{
+		Family: syscall.AF_NETLINK,
+		Pid:    uint32(0),
+		Groups: uint32(groups),
+	}
 
-	http.Handle(metricsPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-             <head><title>ovs Exporter</title></head>
-             <body>
-             <h1>ovs Exporter</h1>
-             <p><a href='` + metricsPath + `'>Metrics</a></p>
-             </body>
-             </html>`))
-	})
+	err = syscall.Bind(s, saddr)
+	if err != nil {
+		return nil, fmt.Errorf("bind: %s", err)
+	}
 
-	log.Infoln("Listening on", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, nil))
+	return &NetlinkListener{fd: s, sa: saddr}, nil
+}
+
+func (l *NetlinkListener) ReadMsgs() ([]syscall.NetlinkMessage, error) {
+	defer func() {
+		recover()
+	}()
+
+	pkt := make([]byte, 2048)
+
+	n, err := syscall.Read(l.fd, pkt)
+	if err != nil {
+		return nil, fmt.Errorf("read: %s", err)
+	}
+
+	msgs, err := syscall.ParseNetlinkMessage(pkt[:n])
+	if err != nil {
+		return nil, fmt.Errorf("parse: %s", err)
+	}
+
+	return msgs, nil
+}
+
+func IsNewAddr(msg *syscall.NetlinkMessage) bool {
+	if msg.Header.Type == syscall.RTM_NEWADDR {
+		return true
+	}
+
+	return false
+}
+
+func IsDelAddr(msg *syscall.NetlinkMessage) bool {
+	if msg.Header.Type == syscall.RTM_DELADDR {
+		return true
+	}
+
+	return false
+}
+
+// rtm_scope is the distance to the destination:
+//
+// RT_SCOPE_UNIVERSE   global route
+// RT_SCOPE_SITE       interior route in the
+// local autonomous system
+// RT_SCOPE_LINK       route on this link
+// RT_SCOPE_HOST       route on the local host
+// RT_SCOPE_NOWHERE    destination doesn't exist
+//
+// The values between RT_SCOPE_UNIVERSE and RT_SCOPE_SITE are
+// available to the user.
+
+func IsRelevant(msg *syscall.IfAddrmsg) bool {
+	if msg.Scope == syscall.RT_SCOPE_UNIVERSE ||
+		msg.Scope == syscall.RT_SCOPE_SITE {
+		return true
+	}
+
+	return false
 }
